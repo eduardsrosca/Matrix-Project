@@ -9,7 +9,7 @@ This repository contains the source code and documentation for the first milesto
 ## Concept
 
 **Planned Game Direction:**
-<!-- dungeon explorer ? -->
+dungeon explorer ?
 
 ---
 
