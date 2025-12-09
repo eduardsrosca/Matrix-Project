@@ -1,0 +1,519 @@
+#include <LiquidCrystal.h>
+#include "LedControl.h"
+#include <EEPROM.h>
+
+// --- PIN DEFINITIONS ---
+// LCD 
+// RS=9, EN=8, D4=7, D5=A4 (Moved from 6), D6=5, D7=4
+// Backlight (LED+) connected to Pin 6 for Brightness Control
+const byte rs = 9;
+const byte en = 8;
+const byte d4 = 7;
+const byte d5 = A4; 
+const byte d6 = 5;
+const byte d7 = 4;
+const byte lcdBacklightPin = 6; 
+LiquidCrystal lcd(rs, en, d4, d5, d6, d7);
+
+// Matrix
+const int dinPin = 12;
+const int clockPin = 11;
+const int loadPin = 10;
+LedControl lc = LedControl(dinPin, clockPin, loadPin, 1);
+
+// Joystick
+const int xPin = A0; 
+const int yPin = A1; 
+const int swPin = A2;
+
+// Extra Components
+const int buzzerPin = 3;
+const int trigPin = 13;
+const int echoPin = 2;
+
+// --- EEPROM ADDRESSES ---
+const int ADDR_MAGIC = 0;        
+const int ADDR_LCD_BRIGHT = 1;
+const int ADDR_MAT_BRIGHT = 2;
+const int ADDR_SOUND = 3;
+const int ADDR_HIGHSCORE_START = 10; 
+
+// --- GLOBAL VARIABLES ---
+struct HighScore {
+  char name[4]; 
+  int score;
+};
+
+// Default Settings
+byte lcdBrightness = 128;
+byte matrixBrightness = 4;
+bool soundEnabled = true;
+char playerName[4] = "EDS";
+
+// System State
+enum State { INTRO, MENU, GAME, LEVEL_WIN, SETTINGS, HIGHSCORES, HOW_TO, ABOUT, NAME_ENTRY };
+State currentState = INTRO;
+State returnState = MENU; 
+
+// Menu Variables
+String mainMenuItems[] = {"Start Game", "High Scores", "Settings", "How To Play", "About"};
+int menuLength = 5;
+int currentSelection = 0;
+bool menuChanged = true;
+
+// Settings Menu Variables
+String settingsItems[] = {"Enter Name", "LCD Bright", "Mat. Bright", "Sound", "Reset Score", "Back"};
+int settingsLength = 6;
+int settingsSelection = 0;
+
+// Game Logic
+const int MAP_SIZE = 16;
+byte gameMap[MAP_SIZE][MAP_SIZE];
+int playerRow = 1, playerCol = 1;
+int exitRow = 14, exitCol = 14;
+int cameraRow = 0, cameraCol = 0;
+unsigned long lastGameMove = 0;
+int currentScore = 0; 
+int currentLevel = 1;
+
+// Visuals
+bool playerVisible = true;
+unsigned long lastBlink = 0;
+
+// Hammer Logic
+unsigned long lastSensorRead = 0;
+bool hammerActive = false;
+unsigned long smashTimer = 0;
+bool showingSmash = false;
+
+// Inputs
+bool buttonState = HIGH;
+bool lastButtonState = HIGH;
+unsigned long lastDebounceTime = 0;
+unsigned long lastMenuMove = 0;
+
+// --- MATRIX ICONS ---
+const byte ICON_PLAY[8] = {0x00, 0x08, 0x1C, 0x3E, 0x7F, 0x3E, 0x1C, 0x08}; 
+const byte ICON_CUP[8]  = {0x00, 0x7E, 0x3C, 0x18, 0x18, 0x18, 0x3C, 0x7E}; 
+const byte ICON_TOOL[8] = {0x18, 0x18, 0x18, 0x18, 0x7E, 0x3C, 0x18, 0x00}; 
+const byte ICON_BOOK[8] = {0x00, 0x3C, 0x24, 0x24, 0x3C, 0x24, 0x24, 0x3C}; 
+const byte ICON_INFO[8] = {0x18, 0x18, 0x00, 0x18, 0x18, 0x18, 0x18, 0x18}; 
+
+// --- SETUP ---
+void setup() {
+  Serial.begin(9600);
+  pinMode(swPin, INPUT_PULLUP);
+  pinMode(trigPin, OUTPUT);
+  pinMode(echoPin, INPUT);
+  pinMode(buzzerPin, OUTPUT);
+  pinMode(lcdBacklightPin, OUTPUT);
+
+  // Initialize Hardware
+  lcd.begin(16, 2);
+  lc.shutdown(0, false);
+  lc.clearDisplay(0);
+  randomSeed(analogRead(A5));
+
+  // Load EEPROM
+  if (EEPROM.read(ADDR_MAGIC) != 123) {
+    EEPROM.write(ADDR_MAGIC, 123);
+    EEPROM.write(ADDR_LCD_BRIGHT, 128);
+    EEPROM.write(ADDR_MAT_BRIGHT, 4);
+    EEPROM.write(ADDR_SOUND, 1);
+    resetHighScores();
+  }
+  
+  // Apply Settings
+  lcdBrightness = EEPROM.read(ADDR_LCD_BRIGHT);
+  matrixBrightness = EEPROM.read(ADDR_MAT_BRIGHT);
+  soundEnabled = (EEPROM.read(ADDR_SOUND) == 1);
+  
+  analogWrite(lcdBacklightPin, lcdBrightness);
+  lc.setIntensity(0, matrixBrightness);
+
+  showIntro();
+}
+
+void loop() {
+  switch (currentState) {
+    case INTRO: currentState = MENU; break;
+    case MENU: handleMenu(); break;
+    case GAME: handleGame(); break;
+    case LEVEL_WIN: handleLevelWin(); break; 
+    case SETTINGS: handleSettings(); break;
+    case HIGHSCORES: showHighScores(); break;
+    case HOW_TO: showTextScreen("Find the exit!", "Wave hand=Smash"); break;
+    case ABOUT: showTextScreen("Maze Breaker", "By: Rosca Eduard"); break; 
+    case NAME_ENTRY: handleNameEntry(); break;
+  }
+}
+
+// --- MENU SYSTEM ---
+void handleMenu() {
+  if (menuChanged) {
+    lc.clearDisplay(0);
+    switch(currentSelection) {
+      case 0: displayIcon(ICON_PLAY); break;
+      case 1: displayIcon(ICON_CUP); break;
+      case 2: displayIcon(ICON_TOOL); break;
+      case 3: displayIcon(ICON_BOOK); break;
+      case 4: displayIcon(ICON_INFO); break;
+    }
+  }
+  
+  // Navigation
+  int xValue = analogRead(xPin);
+  if (millis() - lastMenuMove > 250) {
+    if (xValue < 200) { currentSelection++; menuChanged = true; playTone(600, 20); }
+    if (xValue > 800) { currentSelection--; menuChanged = true; playTone(600, 20); }
+    if (currentSelection < 0) currentSelection = menuLength - 1;
+    if (currentSelection >= menuLength) currentSelection = 0;
+    lastMenuMove = millis();
+  }
+  
+  if (menuChanged) {
+    lcd.clear();
+    lcd.setCursor(0, 0); lcd.print(">" + mainMenuItems[currentSelection]);
+    lcd.setCursor(0, 1); lcd.print(" " + mainMenuItems[(currentSelection + 1) % menuLength]);
+    menuChanged = false;
+  }
+
+  if (readButton()) {
+    playTone(1000, 50);
+    lc.clearDisplay(0);
+    menuChanged = true;
+    switch(currentSelection) {
+      case 0: startGame(); break;
+      case 1: currentState = HIGHSCORES; break;
+      case 2: currentState = SETTINGS; settingsSelection = 0; break;
+      case 3: currentState = HOW_TO; break;
+      case 4: currentState = ABOUT; break;
+    }
+  }
+}
+
+void handleSettings() {
+  int xValue = analogRead(xPin);
+  int yValue = analogRead(yPin);
+  
+  // 1. Navigation
+  if (millis() - lastMenuMove > 200) {
+    if (xValue < 200) { settingsSelection++; menuChanged = true; lc.clearDisplay(0); playTone(600, 20); }
+    if (xValue > 800) { settingsSelection--; menuChanged = true; lc.clearDisplay(0); playTone(600, 20); }
+    if (settingsSelection < 0) settingsSelection = settingsLength - 1;
+    if (settingsSelection >= settingsLength) settingsSelection = 0;
+
+    // 2. Adjustment
+    bool valueChanged = false;
+    
+    // LCD Brightness
+    if (settingsSelection == 1) { 
+       if (yValue > 800 && lcdBrightness < 255) { lcdBrightness += 15; valueChanged = true; }
+       if (yValue < 200 && lcdBrightness > 15) { lcdBrightness -= 15; valueChanged = true; }
+       if (valueChanged) analogWrite(lcdBacklightPin, lcdBrightness);
+    }
+    // Matrix Brightness
+    if (settingsSelection == 2) { 
+       if (yValue > 800 && matrixBrightness < 15) { matrixBrightness++; valueChanged = true; }
+       if (yValue < 200 && matrixBrightness > 0) { matrixBrightness--; valueChanged = true; }
+       if (valueChanged) lc.setIntensity(0, matrixBrightness);
+    }
+    // Sound Toggle
+    if (settingsSelection == 3) {
+       if (yValue < 200 || yValue > 800) { soundEnabled = !soundEnabled; valueChanged = true; }
+    }
+    
+    if (valueChanged) { menuChanged = true; playTone(200, 10); }
+    lastMenuMove = millis();
+  }
+
+  // 3. Render
+  if (menuChanged) {
+    lcd.clear();
+    lcd.setCursor(0, 0); lcd.print(settingsItems[settingsSelection]);
+    lcd.setCursor(0, 1);
+    switch(settingsSelection) {
+      case 0: lcd.print("Press to Edit"); break;
+      case 1: drawBar(lcdBrightness, 0, 255); break;
+      case 2: drawBar(matrixBrightness, 0, 15); for(int i=0; i<8; i++) lc.setRow(0, i, 255); break;
+      case 3: lcd.print(soundEnabled ? " <   ON   >   " : " <   OFF  >   "); break;
+      case 4: lcd.print("Press to Reset"); break;
+      case 5: lcd.print("Return to Menu"); break;
+    }
+    menuChanged = false;
+  }
+
+  // 4. Action
+  if (readButton()) {
+    playTone(1000, 50);
+    EEPROM.write(ADDR_LCD_BRIGHT, lcdBrightness);
+    EEPROM.write(ADDR_MAT_BRIGHT, matrixBrightness);
+    EEPROM.write(ADDR_SOUND, soundEnabled ? 1 : 0);
+    lc.clearDisplay(0); 
+    switch(settingsSelection) {
+      case 0: currentState = NAME_ENTRY; returnState = SETTINGS; break;
+      case 4: resetHighScores(); lcd.clear(); lcd.print("Scores Reset!"); delay(1000); menuChanged = true; break;
+      case 5: currentState = MENU; break;
+    }
+  }
+}
+
+void handleNameEntry() {
+  static int charIndex = 0;
+  lcd.setCursor(0, 0); lcd.print("Enter Name:");
+  lcd.setCursor(0, 1); lcd.print(playerName);
+  lcd.setCursor(charIndex, 1); lcd.blink(); 
+
+  int xValue = analogRead(xPin);
+  int yValue = analogRead(yPin);
+
+  if (millis() - lastMenuMove > 200) {
+    if (xValue < 200) playerName[charIndex]++; 
+    if (xValue > 800) playerName[charIndex]--; 
+    if (yValue > 800) { charIndex = (charIndex + 1) % 3; } 
+    if (yValue < 200) { charIndex = (charIndex - 1 + 3) % 3; } 
+    lastMenuMove = millis();
+  }
+
+  if (readButton()) {
+    lcd.noBlink();
+    currentState = returnState;
+    menuChanged = true;
+  }
+}
+
+// --- GAME LOGIC ---
+void startGame() {
+  generateMaze();
+  playerRow = 1; playerCol = 1;
+  cameraRow = 0; cameraCol = 0;
+  currentScore = 0; 
+  currentLevel = 1;
+  hammerActive = false;
+  currentState = GAME;
+  lcd.clear();
+  lcd.print("Level 1 Start!");
+  delay(1000);
+  lcd.clear();
+}
+
+void handleGame() {
+  // 1. Score & Info Display
+  if (!showingSmash && millis() % 500 < 50) { 
+     lcd.setCursor(0, 0); lcd.print("Lvl:" + String(currentLevel) + " Score:" + String(currentScore));
+     lcd.setCursor(0, 1); lcd.print("Wave to Smash   ");
+  }
+
+  // 2. Movement
+  if (millis() - lastGameMove > 200) {
+    int xValue = analogRead(xPin);
+    int yValue = analogRead(yPin);
+    int newRow = playerRow; 
+    int newCol = playerCol;
+
+    if (xValue < 200) newRow++; 
+    if (xValue > 800) newRow--; 
+    if (yValue > 800) newCol++; 
+    if (yValue < 200) newCol--; 
+
+    if (newRow >= 0 && newRow < MAP_SIZE && newCol >= 0 && newCol < MAP_SIZE) {
+      if (gameMap[newRow][newCol] != 1) {
+        playerRow = newRow; playerCol = newCol;
+      }
+    }
+    
+    if (playerRow == exitRow && playerCol == exitCol) {
+      currentState = LEVEL_WIN; 
+    }
+    lastGameMove = millis();
+  }
+
+  // 3. Sensor Logic
+  if (millis() - lastSensorRead > 150) {
+     long duration, distance;
+     digitalWrite(trigPin, LOW); delayMicroseconds(2);
+     digitalWrite(trigPin, HIGH); delayMicroseconds(10);
+     digitalWrite(trigPin, LOW);
+     duration = pulseIn(echoPin, HIGH, 25000);
+     distance = duration * 0.034 / 2;
+
+     if (distance > 0 && distance < 15 && !hammerActive) {
+        breakWalls();
+        hammerActive = true;
+     } else if (distance > 20) {
+        hammerActive = false;
+     }
+     lastSensorRead = millis();
+  }
+  
+  if (showingSmash && millis() - smashTimer > 2000) showingSmash = false;
+
+  updateCamera();
+  renderGame();
+}
+
+void handleLevelWin() {
+  // Update Score (100 points per win)
+  currentScore += 100;
+  
+  // Win Sound (C Major Arpeggio)
+  playTone(523, 150); delay(150);
+  playTone(659, 150); delay(150);
+  playTone(784, 150); delay(150);
+  playTone(1046, 300); delay(300);
+
+  if (checkIfHighScore(currentScore)) {
+    saveHighScore(currentScore); 
+  }
+
+  lcd.clear();
+  lcd.print("Level " + String(currentLevel) + " Cleared!");
+  lcd.setCursor(0, 1);
+  lcd.print("Score: " + String(currentScore));
+  
+  // Wait for input
+  bool movedOn = false;
+  while(!movedOn) {
+    lc.setRow(0, random(0,8), random(0,255));
+    delay(50);
+    
+    if (readButton()) {
+      movedOn = true;
+      lc.clearDisplay(0);
+      currentLevel++;
+      generateMaze();
+      playerRow = 1; playerCol = 1;
+      currentState = GAME; 
+    }
+  }
+}
+
+// --- HELPERS ---
+void breakWalls() {
+  bool destroyed = false;
+  for(int r=-1; r<=1; r++) for(int c=-1; c<=1; c++) {
+      int tr = playerRow+r, tc = playerCol+c;
+      if(tr>0 && tr<MAP_SIZE-1 && tc>0 && tc<MAP_SIZE-1 && gameMap[tr][tc]==1) {
+         gameMap[tr][tc]=0; destroyed=true;
+      }
+  }
+  if(destroyed) { 
+    playTone(150, 400); 
+    lcd.setCursor(0,1); lcd.print("SMASH!          ");
+    showingSmash=true; smashTimer=millis();
+  }
+}
+
+void showTextScreen(String line1, String line2) {
+  if (menuChanged) { lcd.clear(); lcd.print(line1); lcd.setCursor(0, 1); lcd.print(line2); menuChanged = false; }
+  if (readButton()) { currentState = MENU; menuChanged = true; delay(300); }
+}
+
+bool readButton() {
+  int reading = digitalRead(swPin);
+  if (reading != lastButtonState) lastDebounceTime = millis();
+  bool pressed = false;
+  if ((millis() - lastDebounceTime) > 50) {
+    if (reading != buttonState) {
+      buttonState = reading;
+      if (buttonState == LOW) pressed = true;
+    }
+  }
+  lastButtonState = reading;
+  return pressed;
+}
+
+void displayIcon(const byte* icon) {
+  for (int i = 0; i < 8; i++) lc.setRow(0, i, icon[i]);
+}
+
+void playTone(int freq, int duration) {
+  if (soundEnabled) tone(buzzerPin, freq, duration);
+}
+
+void drawBar(int value, int minValue, int maxValue) {
+  int mapVal = map(value, minValue, maxValue, 0, 14);
+  lcd.print("[");
+  for (int i = 0; i < 14; i++) {
+    if (i < mapVal) lcd.print("="); 
+    else lcd.print(" ");            
+  }
+  lcd.print("]");
+}
+
+// --- EEPROM ---
+void resetHighScores() {
+  for (int i = 0; i < 3; i++) {
+    EEPROM.put(ADDR_HIGHSCORE_START + i * sizeof(HighScore), (HighScore){"AAA", 0});
+  }
+}
+
+void showHighScores() {
+  HighScore hs;
+  if (menuChanged) {
+    lcd.clear(); lcd.print("Top Scores:");
+    EEPROM.get(ADDR_HIGHSCORE_START, hs);
+    lcd.setCursor(0, 1); lcd.print("1." + String(hs.name) + " " + String(hs.score));
+    menuChanged = false;
+  }
+  if (readButton()) { currentState = MENU; menuChanged = true; }
+}
+
+bool checkIfHighScore(int score) {
+  HighScore hs;
+  for (int i = 0; i < 3; i++) {
+    EEPROM.get(ADDR_HIGHSCORE_START + i * sizeof(HighScore), hs);
+    if (score > hs.score) return true;
+  }
+  return false;
+}
+
+void saveHighScore(int score) {
+  HighScore newScore;
+  strcpy(newScore.name, playerName);
+  newScore.score = score;
+  
+  HighScore temp;
+  for (int i = 0; i < 3; i++) {
+    int addr = ADDR_HIGHSCORE_START + i * sizeof(HighScore);
+    EEPROM.get(addr, temp);
+    if (score > temp.score) {
+      EEPROM.put(addr, newScore); 
+      score = temp.score; 
+      strcpy(newScore.name, temp.name); 
+      newScore.score = temp.score;
+    }
+  }
+}
+
+void generateMaze() {
+  for(int r=0; r<MAP_SIZE; r++) for(int c=0; c<MAP_SIZE; c++) {
+      if (r==0||r==MAP_SIZE-1||c==0||c==MAP_SIZE-1) gameMap[r][c]=1;
+      else gameMap[r][c] = (random(100)<20) ? 1 : 0;
+  }
+  gameMap[1][1]=0; gameMap[14][14]=0;
+}
+
+void updateCamera() {
+  if (playerRow >= cameraRow + 6) cameraRow++; 
+  if (playerCol >= cameraCol + 6) cameraCol++; 
+  if (playerRow <= cameraRow + 1) cameraRow--; 
+  if (playerCol <= cameraCol + 1) cameraCol--;
+  if (cameraRow > 8) cameraRow = 8; if (cameraCol > 8) cameraCol = 8;
+  if (cameraRow < 0) cameraRow = 0; if (cameraCol < 0) cameraCol = 0;
+}
+
+void renderGame() {
+  if (millis() - lastBlink > 300) { playerVisible = !playerVisible; lastBlink = millis(); }
+  for (int r = 0; r < 8; r++) for (int c = 0; c < 8; c++) {
+      bool on = (gameMap[cameraRow+r][cameraCol+c] == 1);
+      if ((cameraRow+r)==playerRow && (cameraCol+c)==playerCol) on = playerVisible;
+      if ((cameraRow+r)==exitRow && (cameraCol+c)==exitCol) on = (millis()%200<100);
+      lc.setLed(0, r, c, on);
+  }
+}
+
+void showIntro() {
+  lcd.clear(); lcd.print("Maze Breaker!"); lcd.setCursor(0,1); lcd.print("Matrix Project");
+  playTone(500, 100); delay(1500); currentState = MENU; lcd.clear();
+}
